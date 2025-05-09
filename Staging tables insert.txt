@@ -1,0 +1,60 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, to_date, lit
+from functools import reduce
+
+def combine_staging_hive_sql(
+    start_year=2005,
+    end_year=2024,
+    date_col="event_time",        # Replace with your actual date column
+    final_table="final_table"     # Final Hive table
+):
+    spark = SparkSession.builder \
+        .appName("Combine Hive Staging Tables via SQL") \
+        .enableHiveSupport() \
+        .getOrCreate()
+
+    all_columns_set = set()
+    dfs = []
+
+    # Step 1: Read staging tables using SQL
+    for year in range(start_year, end_year + 1):
+        for month in range(1, 13):
+            table_name = f"staging_{year}_{month:02d}"
+            try:
+                df = spark.sql(f"SELECT * FROM {table_name}")
+                dfs.append((table_name, df))
+                all_columns_set.update(df.columns)
+            except Exception as e:
+                print(f"Skipping {table_name}: {e}")
+
+    if not dfs:
+        print("No staging tables found.")
+        return
+
+    all_columns = sorted(all_columns_set)
+
+    # Step 2: Align schema with NULLs for missing columns
+    def align_schema(df, all_cols):
+        existing = set(df.columns)
+        for col_name in all_cols:
+            if col_name not in existing:
+                df = df.withColumn(col_name, lit(None))
+        return df.select(*all_cols)
+
+    aligned_dfs = [align_schema(df, all_columns) for _, df in dfs]
+
+    # Step 3: Combine and deduplicate
+    combined_df = reduce(lambda a, b: a.unionByName(b), aligned_dfs)
+    combined_df = combined_df.withColumn("date_partition", to_date(col(date_col)))
+    deduped_df = combined_df.dropDuplicates()
+
+    # Step 4: Insert into final partitioned Hive table
+    deduped_df.createOrReplaceTempView("staging_all")
+
+    spark.sql(f"""
+        INSERT OVERWRITE TABLE {final_table}
+        PARTITION (date_partition)
+        SELECT * FROM staging_all
+    """)
+
+    print("Successfully loaded data into final Hive table.")
