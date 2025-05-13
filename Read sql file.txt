@@ -1,0 +1,78 @@
+import re
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+
+# Step 1: Load queries from SQL file
+def load_queries_from_file(file_path):
+    try:
+        with open(file_path, 'r') as file:
+            content = file.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Query file not found: {file_path}")
+    except Exception as e:
+        raise Exception(f"Error reading file: {e}")
+
+    queries = {}
+    sections = content.split('-- table:')
+    for section in sections[1:]:
+        lines = section.strip().split('\n')
+        table_name = lines[0].strip()
+        query = '\n'.join(lines[1:]).strip()
+        queries[table_name] = query
+
+    return queries
+
+# Step 2: Replace FROM <table> with FROM <table> AS <alias>
+def replace_table_with_alias(query, table_name, alias):
+    try:
+        pattern = rf"(?i)\bFROM\s+{table_name}\b"
+        replacement = f"FROM {table_name} AS {alias}"
+        updated_query = re.sub(pattern, replacement, query)
+        return updated_query
+    except Exception as e:
+        raise Exception(f"Error processing alias replacement: {e}")
+
+# Step 3: Main execution
+def main():
+    try:
+        # Initialize Spark session
+        spark = SparkSession.builder \
+            .appName("Run SQL Query with Alias") \
+            .getOrCreate()
+
+        # Load queries from file
+        file_path = "queries.sql"  # Path to your SQL file
+        queries = load_queries_from_file(file_path)
+
+        # Choose a table and alias
+        table_name = "orders"     # The table to run query for
+        alias = "o"               # The alias you want to use
+
+        # Get and modify query
+        original_query = queries.get(table_name)
+        if not original_query:
+            raise ValueError(f"No query found for table '{table_name}'")
+
+        aliased_query = replace_table_with_alias(original_query, table_name, alias)
+        print("Running Query:\n", aliased_query)
+
+        # Execute query
+        try:
+            result_df = spark.sql(aliased_query)
+            result_df.show()
+        except AnalysisException as ae:
+            raise AnalysisException(f"Spark SQL error: {ae}")
+        except Exception as e:
+            raise Exception(f"Unexpected error during Spark SQL execution: {e}")
+
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        # Stop Spark even if an error occurs
+        try:
+            spark.stop()
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
