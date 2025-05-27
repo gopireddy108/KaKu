@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# === CONFIG ===
+PYSPARK_SCRIPT="your_pyspark_script.py"
+LOG_OUTPUT_FILE="user_logs.txt"
+
+# === SUBMIT JOB ===
+echo "Submitting PySpark job..."
+APP_ID=$(spark-submit --master yarn --deploy-mode cluster "$PYSPARK_SCRIPT" 2>&1 | tee spark_submit_output.log | grep -oE 'application_[0-9_]+')
+
+if [ -z "$APP_ID" ]; then
+    echo "ERROR: Failed to extract application ID from spark-submit output."
+    exit 1
+fi
+
+echo "Submitted application: $APP_ID"
+
+# === WAIT FOR APP TO FINISH ===
+echo "Waiting for application to finish..."
+STATUS=""
+while [[ "$STATUS" != "FINISHED" && "$STATUS" != "FAILED" && "$STATUS" != "KILLED" ]]; do
+    STATUS=$(yarn application -status "$APP_ID" 2>/dev/null | grep "Final-State" | awk '{print $3}')
+    sleep 5
+done
+
+echo "Application finished with state: $STATUS"
+
+# === GET ONLY USER LOGS ===
+echo "Fetching user logs for $APP_ID (stdout only)..."
+yarn logs -applicationId "$APP_ID" | awk '/LogType:stdout/,/End of LogType:stdout/' > "$LOG_OUTPUT_FILE"
+
+echo "User logs saved to $LOG_OUTPUT_FILE"
