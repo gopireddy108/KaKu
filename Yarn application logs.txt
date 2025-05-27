@@ -1,32 +1,55 @@
 #!/bin/bash
 
-# === CONFIG ===
-PYSPARK_SCRIPT="your_pyspark_script.py"
-LOG_OUTPUT_FILE="user_logs.txt"
+# Configuration
+SPARK_HOME=/path/to/spark
+PYSPARK_SCRIPT=your_script.py
+CLUSTER_CONFIG="--master yarn --deploy-mode cluster"
+LOG_DIR=./spark_logs
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-# === SUBMIT JOB ===
-echo "Submitting PySpark job..."
-APP_ID=$(spark-submit --master yarn --deploy-mode cluster "$PYSPARK_SCRIPT" 2>&1 | tee spark_submit_output.log | grep -oE 'application_[0-9_]+')
+# Create log directory if it doesn't exist
+mkdir -p $LOG_DIR
 
-if [ -z "$APP_ID" ]; then
-    echo "ERROR: Failed to extract application ID from spark-submit output."
+# Submit the PySpark job and capture the output
+submit_output=$($SPARK_HOME/bin/spark-submit $CLUSTER_CONFIG $PYSPARK_SCRIPT 2>&1)
+
+# Extract application ID
+app_id=$(echo "$submit_output" | grep -oP 'application_\d+_\d+')
+
+if [ -z "$app_id" ]; then
+    echo "Failed to submit application or retrieve application ID"
+    echo "$submit_output"
     exit 1
 fi
 
-echo "Submitted application: $APP_ID"
+echo "Submitted application ID: $app_id"
 
-# === WAIT FOR APP TO FINISH ===
+# Function to check application status
+get_application_status() {
+    yarn application -status $app_id 2>/dev/null | grep "State" | awk '{print $3}'
+}
+
+# Wait for application to finish
 echo "Waiting for application to finish..."
-STATUS=""
-while [[ "$STATUS" != "FINISHED" && "$STATUS" != "FAILED" && "$STATUS" != "KILLED" ]]; do
-    STATUS=$(yarn application -status "$APP_ID" 2>/dev/null | grep "Final-State" | awk '{print $3}')
+while true; do
+    status=$(get_application_status)
+    
+    if [[ "$status" == "FINISHED" || "$status" == "FAILED" || "$status" == "KILLED" ]]; then
+        echo "Application $app_id has $status"
+        break
+    fi
+    
     sleep 5
 done
 
-echo "Application finished with state: $STATUS"
+# Retrieve only the user logs (stdout)
+echo "Retrieving logs for $app_id..."
+yarn logs -applicationId $app_id > $LOG_DIR/${app_id}_full.log 2>/dev/null
 
-# === GET ONLY USER LOGS ===
-echo "Fetching user logs for $APP_ID (stdout only)..."
-yarn logs -applicationId "$APP_ID" | awk '/LogType:stdout/,/End of LogType:stdout/' > "$LOG_OUTPUT_FILE"
+# Extract only the stdout content (user logs)
+awk '/^LogType:stdout/,/^LogType:stderr/' $LOG_DIR/${app_id}_full.log | grep -v '^LogType:' > $LOG_DIR/${app_id}_stdout.log
 
-echo "User logs saved to $LOG_OUTPUT_FILE"
+# Clean up full log if you only want stdout
+rm $LOG_DIR/${app_id}_full.log
+
+echo "User logs saved to $LOG_DIR/${app_id}_stdout.log"
