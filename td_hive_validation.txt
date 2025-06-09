@@ -1,0 +1,216 @@
+import argparse
+from pyspark.sql import SparkSession, Row
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StringType, NumericType, DateType, TimestampType,
+    FloatType, DoubleType, DecimalType
+)
+
+# A tolerance for comparing floating point numbers
+FLOAT_TOLERANCE = 1e-9
+
+def get_spark_session(app_name="Teradata_Hive_Validator"):
+    """Initializes and returns a SparkSession with Hive support."""
+    return SparkSession.builder \
+        .appName(app_name) \
+        .enableHiveSupport() \
+        .getOrCreate()
+
+def read_teradata_table(spark, jdbc_url, user, password, table, filter_condition=None):
+    """Reads data from a Teradata table into a DataFrame."""
+    query = f"(SELECT * FROM {table}) AS td_alias"
+    if filter_condition:
+        query = f"(SELECT * FROM {table} WHERE {filter_condition}) AS td_alias"
+    print(f"Reading Teradata data with query: {query}")
+    return spark.read.format("jdbc") \
+        .option("url", jdbc_url) \
+        .option("user", user) \
+        .option("password", password) \
+        .option("dbtable", query) \
+        .option("driver", "com.teradata.jdbc.TeraDriver") \
+        .load()
+
+def read_hive_table(spark, table, filter_condition=None):
+    """Reads data from a Hive table into a DataFrame."""
+    print(f"Reading Hive table: {table}")
+    df = spark.read.table(table)
+    if filter_condition:
+        print(f"Applying filter condition to Hive data: {filter_condition}")
+        df = df.where(filter_condition)
+    return df
+
+def normalize_dataframe_for_comparison(df, columns_to_check):
+    """Casts specified columns to StringType for row-by-row comparison."""
+    lower_col_map = {c: c.lower() for c in df.columns}
+    selected_lower_cols = [lower_col_map[c] for c in columns_to_check]
+    df_renamed = df.toDF(*[c.lower() for c in df.columns])
+    df_normalized = df_renamed.select(
+        [F.col(c).cast(StringType()).alias(c) for c in selected_lower_cols]
+    )
+    return df_normalized
+
+def perform_aggregate_validations(df_teradata, df_hive, columns_to_check):
+    """Performs and compares MIN, MAX, and SUM aggregations on columns based on data type."""
+    print("\n2. Aggregate Value Validation (on original data types):")
+    td_schema = {f.name.lower(): f.dataType for f in df_teradata.schema.fields}
+    td_orig_case_map = {c.lower(): c for c in df_teradata.columns}
+    hive_orig_case_map = {c.lower(): c for c in df_hive.columns}
+    td_agg_exprs, hive_agg_exprs = [], []
+
+    for col_lower in columns_to_check:
+        td_col, hive_col = td_orig_case_map[col_lower], hive_orig_case_map[col_lower]
+        col_type = td_schema[col_lower]
+        if isinstance(col_type, (NumericType, StringType, DateType, TimestampType)):
+            td_agg_exprs.extend([F.min(F.col(td_col)).alias(f"{col_lower}_min"), F.max(F.col(td_col)).alias(f"{col_lower}_max")])
+            hive_agg_exprs.extend([F.min(F.col(hive_col)).alias(f"{col_lower}_min"), F.max(F.col(hive_col)).alias(f"{col_lower}_max")])
+        if isinstance(col_type, NumericType):
+            td_agg_exprs.append(F.sum(F.col(td_col).cast(DecimalType(38, 10))).alias(f"{col_lower}_sum"))
+            hive_agg_exprs.append(F.sum(F.col(hive_col).cast(DecimalType(38, 10))).alias(f"{col_lower}_sum"))
+    
+    if not td_agg_exprs:
+        print("   - [SKIPPED] No columns eligible for aggregate validation.")
+        return True
+
+    try:
+        td_results, hive_results = df_teradata.agg(*td_agg_exprs).collect()[0], df_hive.agg(*hive_agg_exprs).collect()[0]
+    except Exception as e:
+        print(f"   - [ERROR] Could not perform aggregate validation. Error: {e}")
+        return False
+        
+    all_aggs_match = True
+    for col_lower in columns_to_check:
+        col_type = td_schema[col_lower]
+        print(f"\n   - Column '{col_lower}' (Type: {col_type.simpleString()}):")
+        if f"{col_lower}_min" in td_results:
+            td_min, hive_min = td_results[f"{col_lower}_min"], hive_results[f"{col_lower}_min"]
+            min_match = (td_min == hive_min)
+            print(f"     - MIN Check: TD={td_min} | HIVE={hive_min} -> [{'SUCCESS' if min_match else 'FAILURE'}]")
+            if not min_match: all_aggs_match = False
+            td_max, hive_max = td_results[f"{col_lower}_max"], hive_results[f"{col_lower}_max"]
+            max_match = (td_max == hive_max)
+            print(f"     - MAX Check: TD={td_max} | HIVE={hive_max} -> [{'SUCCESS' if max_match else 'FAILURE'}]")
+            if not max_match: all_aggs_match = False
+        if f"{col_lower}_sum" in td_results:
+            td_sum, hive_sum = td_results[f"{col_lower}_sum"], hive_results[f"{col_lower}_sum"]
+            sum_match = (td_sum == hive_sum) if td_sum is not None and hive_sum is not None and not isinstance(col_type, (FloatType, DoubleType)) else (abs(td_sum - hive_sum) < FLOAT_TOLERANCE if td_sum is not None and hive_sum is not None else td_sum is None and hive_sum is None)
+            print(f"     - SUM Check: TD={td_sum} | HIVE={hive_sum} -> [{'SUCCESS' if sum_match else 'FAILURE'}]")
+            if not sum_match: all_aggs_match = False
+    return all_aggs_match
+
+def main():
+    """Main function to drive the validation process."""
+    parser = argparse.ArgumentParser(description="Validate data between Teradata and Hive with selectable modes.")
+    parser.add_argument("--teradata-host", required=True, help="Teradata database host/IP.")
+    parser.add_argument("--teradata-user", required=True, help="Teradata username.")
+    parser.add_argument("--teradata-pass", required=True, help="Teradata password.")
+    parser.add_argument("--teradata-table", required=True, help="Name of the Teradata table (e.g., 'DB_PROD.CUSTOMER').")
+    parser.add_argument("--hive-table", required=True, help="Name of the Hive table (e.g., 'db_raw.customer').")
+    parser.add_argument("--filter-condition", type=str, default=None, help="Optional SQL WHERE clause to filter data.")
+    parser.add_argument("--columns", type=str, default=None, help="Comma-separated list of columns. Defaults to all common columns.")
+    parser.add_argument(
+        "--validation-mode",
+        type=str,
+        default='all',
+        choices=['all', 'counts', 'aggregates', 'content'],
+        help="Specify validation mode. 'counts': row counts only. 'aggregates': counts + aggregates. 'content': counts + row-by-row data. 'all': all checks (default)."
+    )
+    args = parser.parse_args()
+
+    spark = get_spark_session()
+    jdbc_url = f"jdbc:teradata://{args.teradata_host}/DATABASE={args.teradata_table.split('.')[0]}"
+    print("=" * 80)
+    print(f"         Data Validation (Mode: {args.validation_mode.upper()})         ")
+    print("=" * 80)
+
+    try:
+        df_teradata_raw = read_teradata_table(spark, jdbc_url, args.teradata_user, args.teradata_pass, args.teradata_table, args.filter_condition)
+        df_hive_raw = read_hive_table(spark, args.hive_table, args.filter_condition)
+    except Exception as e:
+        print(f"\n[ERROR] Failed to load data. Aborting. Details: {e}")
+        spark.stop()
+        return
+
+    df_teradata_raw.cache()
+    df_hive_raw.cache()
+
+    td_cols_lower = {c.lower() for c in df_teradata_raw.columns}
+    hive_cols_lower = {c.lower() for c in df_hive_raw.columns}
+    columns_to_check_lower = {c.strip().lower() for c in args.columns.split(',')} if args.columns else td_cols_lower.intersection(hive_cols_lower)
+    
+    if not columns_to_check_lower:
+        print("\n[ERROR] No common columns to validate. Aborting.")
+        spark.stop()
+        return
+
+    print("\n--- Validation Results ---")
+    
+    # 1. Row Count Validation (Always performed)
+    print("\n1. Row Count Validation:")
+    teradata_count = df_teradata_raw.count()
+    hive_count = df_hive_raw.count()
+    print(f"   - Teradata Rows: {teradata_count}")
+    print(f"   - Hive Rows:     {hive_count}")
+    count_match = (teradata_count == hive_count)
+    print(f"   - [{'SUCCESS' if count_match else 'FAILURE'}] Row counts {'match' if count_match else 'DO NOT match'}.")
+
+    # Initialize results
+    aggregates_match = True
+    data_match = True
+
+    # 2. Aggregate Validation (Conditional)
+    if args.validation_mode in ['all', 'aggregates']:
+        aggregates_match = perform_aggregate_validations(df_teradata_raw, df_hive_raw, columns_to_check_lower)
+
+    # 3. Data Content Validation (Conditional)
+    if args.validation_mode in ['all', 'content']:
+        print("\n3. Full Data Content Validation (row-by-row):")
+        if not count_match:
+            print("   - [SKIPPED] Skipping content validation because row counts differ.")
+            data_match = False
+        else:
+            td_orig_case_map = {c.lower(): c for c in df_teradata_raw.columns}
+            hive_orig_case_map = {c.lower(): c for c in df_hive_raw.columns}
+            td_cols_select = [td_orig_case_map[c] for c in columns_to_check_lower]
+            hive_cols_select = [hive_orig_case_map[c] for c in columns_to_check_lower]
+            
+            df_teradata_norm = normalize_dataframe_for_comparison(df_teradata_raw, td_cols_select)
+            df_hive_norm = normalize_dataframe_for_comparison(df_hive_raw, hive_cols_select)
+
+            mismatches_in_td = df_teradata_norm.exceptAll(df_hive_norm).count()
+            mismatches_in_hive = df_hive_norm.exceptAll(df_teradata_norm).count()
+            
+            current_data_match = (mismatches_in_td == 0 and mismatches_in_hive == 0)
+            data_match = data_match and current_data_match
+            
+            if current_data_match:
+                print("   - [SUCCESS] All row data matches perfectly.")
+            else:
+                print("   - [FAILURE] Data content mismatch found.")
+                # To provide samples, we need to re-run without .count()
+                if mismatches_in_td > 0:
+                    print(f"     - Rows in Teradata but not Hive: {mismatches_in_td}. Sample:")
+                    df_teradata_norm.exceptAll(df_hive_norm).show(5, truncate=False)
+                if mismatches_in_hive > 0:
+                    print(f"     - Rows in Hive but not Teradata: {mismatches_in_hive}. Sample:")
+                    df_hive_norm.exceptAll(df_teradata_norm).show(5, truncate=False)
+
+    # Final Summary
+    print("\n--- Final Summary ---")
+    overall_success = count_match
+    if args.validation_mode in ['all', 'aggregates']:
+        overall_success = overall_success and aggregates_match
+    if args.validation_mode in ['all', 'content']:
+        overall_success = overall_success and data_match
+
+    if overall_success:
+        print(f"✅ OVERALL VALIDATION SUCCESSFUL for mode: '{args.validation_mode}'")
+    else:
+        print(f"❌ OVERALL VALIDATION FAILED for mode: '{args.validation_mode}'. Review discrepancies above.")
+    
+    print("=" * 80)
+    df_teradata_raw.unpersist()
+    df_hive_raw.unpersist()
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
