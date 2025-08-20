@@ -1,0 +1,394 @@
+import argparse
+import json
+import logging
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit, regexp_replace
+from pyspark.sql.utils import AnalysisException
+
+class AS400DataImporter:
+    def __init__(self, config_file_path):
+        self.config = self._load_config(config_file_path)
+        self.spark = self._initialize_spark_session()
+        self.logger = self._setup_logging()
+        self.job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+    def _load_config(self, config_file_path):
+        """Load JSON configuration file"""
+        with open(config_file_path) as f:
+            return json.load(f)
+    
+    def _initialize_spark_session(self):
+        """Initialize Spark session with dynamic configuration"""
+        spark_builder = SparkSession.builder.appName("AS400_Data_Importer")
+        
+        # Apply Spark configurations from config
+        for key, value in self.config.get("spark_config", {}).items():
+            spark_builder.config(key, value)
+            
+        return spark_builder.enableHiveSupport().getOrCreate()
+    
+    def _setup_logging(self):
+        """Setup logging configuration"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        return logging.getLogger(__name__)
+    
+    def _log_to_kudu(self, status, message, records_processed=0):
+        """Log job status to Kudu table"""
+        try:
+            log_data = [
+                (self.job_id, self.config["source"]["table"], 
+                 datetime.now(), status, message, records_processed)
+            ]
+            
+            schema = "job_id STRING, table_name STRING, timestamp TIMESTAMP, " \
+                     "status STRING, message STRING, records_processed LONG"
+            
+            log_df = self.spark.createDataFrame(log_data, schema)
+            
+            log_df.write \
+                .format("kudu") \
+                .mode("append") \
+                .option("kudu.master", self.config["logging"]["kudu_master"]) \
+                .option("kudu.table", self.config["logging"]["kudu_table"]) \
+                .save()
+                
+        except Exception as e:
+            self.logger.error(f"Failed to log to Kudu: {str(e)}")
+    
+    def _get_checkpoint_value(self):
+        """Get the last successful checkpoint for this table"""
+        try:
+            checkpoint_df = self.spark.read \
+                .format("kudu") \
+                .option("kudu.master", self.config["logging"]["kudu_master"]) \
+                .option("kudu.table", self.config["logging"]["checkpoint_table"]) \
+                .load()
+                
+            last_checkpoint = checkpoint_df.filter(
+                f"table_name = '{self.config['source']['table']}'"
+            ).agg({"checkpoint_value": "max"}).collect()[0][0]
+            
+            return last_checkpoint if last_checkpoint else None
+            
+        except Exception as e:
+            self.logger.warning(f"Could not read checkpoint: {str(e)}")
+            return None
+    
+    def _update_checkpoint(self, checkpoint_value):
+        """Update the checkpoint value for this table"""
+        try:
+            checkpoint_data = [
+                (self.config["source"]["table"], checkpoint_value, datetime.now())
+            ]
+            
+            schema = "table_name STRING, checkpoint_value STRING, update_timestamp TIMESTAMP"
+            checkpoint_df = self.spark.createDataFrame(checkpoint_data, schema)
+            
+            checkpoint_df.write \
+                .format("kudu") \
+                .mode("append") \
+                .option("kudu.master", self.config["logging"]["kudu_master"]) \
+                .option("kudu.table", self.config["logging"]["checkpoint_table"]) \
+                .save()
+                
+        except Exception as e:
+            self.logger.error(f"Failed to update checkpoint: {str(e)}")
+    
+    def _clean_string_columns(self, df):
+        """Clean special characters from string columns based on configuration"""
+        if not self.config["source"].get("clean_delimiters", False):
+            return df
+            
+        string_handling = self.config["source"].get("string_handling", {})
+        
+        for col_name, col_type in df.dtypes:
+            if col_type == "string":
+                col = df[col_name]
+                if string_handling.get("replace_cr", True):
+                    col = regexp_replace(col, "\r", "")
+                if string_handling.get("replace_lf", True):
+                    col = regexp_replace(col, "\n", "")
+                if string_handling.get("replace_tab", False):
+                    col = regexp_replace(col, "\t", " ")
+                
+                df = df.withColumn(col_name, col)
+        
+        return df
+    
+    def _read_as400_data(self):
+        """Read data from AS400 based on configuration"""
+        jdbc_url = f"jdbc:as400://{self.config['source']['host']}/{self.config['source']['library']}"
+        
+        read_properties = {
+            "user": self.config["source"]["username"],
+            "password": self.config["source"]["password"],
+            "driver": "com.ibm.as400.access.AS400JDBCDriver",
+            "prompt": "false",
+            "errors": "full",
+            "translate binary": "true",
+            "lob threshold": str(self.config["source"].get("lob_threshold", "1048576"))
+        }
+        
+        # Add custom properties if specified
+        read_properties.update(self.config["source"].get("jdbc_properties", {}))
+        
+        # Determine if incremental or full load
+        checkpoint_column = self.config["source"].get("checkpoint_column")
+        last_checkpoint = self._get_checkpoint_value() if checkpoint_column else None
+        
+        # Build query
+        if "columns" in self.config["source"]:
+            columns = []
+            for col in self.config["source"]["columns"]:
+                if isinstance(col, dict):
+                    if col.get("clean_strings", False):
+                        columns.append(f"REPLACE(REPLACE({col['name']}, CHAR(13), ''), CHAR(10), '') AS {col['name']}")
+                    else:
+                        columns.append(col["name"])
+                else:
+                    columns.append(col)
+            columns_clause = ",".join(columns)
+        else:
+            columns_clause = "*"
+        
+        base_query = f"SELECT {columns_clause} FROM {self.config['source']['table']}"
+        
+        if last_checkpoint and checkpoint_column:
+            query = f"{base_query} WHERE {checkpoint_column} > '{last_checkpoint}'"
+            self.logger.info(f"Performing incremental load with query: {query}")
+        else:
+            query = base_query
+            self.logger.info("Performing full load")
+        
+        # Read data with parallelization
+        partition_column = self.config["source"].get("partition_column")
+        num_partitions = self.config["source"].get("num_partitions", 10)
+        
+        if partition_column:
+            # Get min/max values for partitioning
+            min_max_query = f"SELECT MIN({partition_column}) as min_val, MAX({partition_column}) as max_val FROM ({query}) tmp"
+            min_max_df = self.spark.read \
+                .jdbc(url=jdbc_url, table=f"({min_max_query}) as bounds", properties=read_properties)
+            
+            min_val, max_val = min_max_df.collect()[0]
+            
+            # Calculate bounds
+            bounds = [(i, i + ((max_val - min_val) / num_partitions)) 
+                     for i in range(min_val, max_val, (max_val - min_val) // num_partitions)]
+            
+            # Read with partitioning
+            df = self.spark.read \
+                .jdbc(
+                    url=jdbc_url,
+                    table=f"({query}) as data",
+                    column=partition_column,
+                    lowerBound=min_val,
+                    upperBound=max_val,
+                    numPartitions=num_partitions,
+                    properties=read_properties
+                )
+        else:
+            # Read without partitioning
+            df = self.spark.read \
+                .jdbc(url=jdbc_url, table=f"({query}) as data", properties=read_properties)
+        
+        return df
+    
+    def _write_to_hive(self, df):
+        """Write data to Hive table with optional pre-write SQL"""
+        try:
+            hive_config = self.config["targets"]["hive"]
+            mode = "append" if hive_config.get("append", False) else "overwrite"
+            
+            # Create temporary view for SQL operations
+            temp_view_name = f"temp_{self.config['source']['table']}_{self.job_id}"
+            df.createOrReplaceTempView(temp_view_name)
+            
+            # Execute pre-write SQL if specified
+            if "pre_write_sql" in hive_config:
+                self.logger.info(f"Executing Hive pre-write SQL: {hive_config['pre_write_sql']}")
+                transformed_df = self.spark.sql(hive_config["pre_write_sql"])
+            else:
+                transformed_df = df
+            
+            # Write to Hive
+            transformed_df.write \
+                .mode(mode) \
+                .saveAsTable(hive_config["table"])
+                
+            self.logger.info(f"Successfully wrote to Hive table {hive_config['table']}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to write to Hive: {str(e)}")
+            return False
+        finally:
+            # Clean up temporary view
+            try:
+                self.spark.catalog.dropTempView(temp_view_name)
+            except:
+                pass
+    
+    def _write_to_teradata(self, df):
+        """Write data to Teradata table with optional pre-write SQL"""
+        temp_view_name = f"temp_{self.config['source']['table']}_{self.job_id}"
+        try:
+            td_config = self.config["targets"]["teradata"]
+            jdbc_url = f"jdbc:teradata://{td_config['host']}/database={td_config['database']}"
+            mode = "append" if td_config.get("append", False) else "overwrite"
+            
+            # Create temporary view for SQL operations
+            df.createOrReplaceTempView(temp_view_name)
+            
+            # Execute pre-write SQL if specified
+            if "pre_write_sql" in td_config:
+                self.logger.info(f"Executing Teradata pre-write SQL: {td_config['pre_write_sql']}")
+                write_df = self.spark.sql(td_config["pre_write_sql"])
+            else:
+                write_df = df
+            
+            # Teradata-specific write options
+            write_properties = {
+                "user": td_config["username"],
+                "password": td_config["password"],
+                "driver": "com.teradata.jdbc.TeraDriver"
+            }
+            
+            # Add batch size for better performance
+            if "batch_size" in td_config:
+                write_properties["batchsize"] = str(td_config["batch_size"])
+            
+            # Transaction control
+            if "transaction" in td_config:
+                write_properties["autocommit"] = "false" if td_config["transaction"] else "true"
+            
+            # Write to Teradata
+            write_df.write \
+                .jdbc(
+                    url=jdbc_url,
+                    table=td_config["table"],
+                    mode=mode,
+                    properties=write_properties
+                )
+            
+            self.logger.info(f"Successfully wrote to Teradata table {td_config['table']}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to write to Teradata: {str(e)}")
+            return False
+        finally:
+            # Clean up temporary view
+            try:
+                self.spark.catalog.dropTempView(temp_view_name)
+            except:
+                pass
+    
+    def _write_to_file(self, df):
+        """Write data to file system"""
+        try:
+            file_config = self.config["targets"]["file"]
+            
+            # Clean data first if needed
+            if file_config.get("clean_delimiters", False):
+                df = self._clean_string_columns(df)
+            
+            writer = df.write \
+                .format(file_config["format"]) \
+                .mode("overwrite")
+            
+            # Add format-specific options
+            if file_config["format"] in ["csv", "tsv"]:
+                writer = writer \
+                    .option("delimiter", file_config.get("delimiter", ",")) \
+                    .option("header", file_config.get("header", True)) \
+                    .option("escape", file_config.get("escape", "\\")) \
+                    .option("quote", file_config.get("quote", "\"")) \
+                    .option("multiLine", file_config.get("multiLine", "false"))
+            
+            writer.save(file_config["path"])
+                
+            self.logger.info(f"Successfully wrote to file {file_config['path']}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to write to file: {str(e)}")
+            return False
+    
+    def _update_checkpoint_from_data(self, df):
+        """Update checkpoint value from the latest data"""
+        checkpoint_column = self.config["source"].get("checkpoint_column")
+        if checkpoint_column:
+            try:
+                max_value = df.agg({checkpoint_column: "max"}).collect()[0][0]
+                if max_value:
+                    self._update_checkpoint(str(max_value))
+                    self.logger.info(f"Updated checkpoint to {max_value}")
+            except Exception as e:
+                self.logger.error(f"Failed to update checkpoint from data: {str(e)}")
+    
+    def run(self):
+        """Main execution method"""
+        try:
+            self.logger.info(f"Starting job {self.job_id} for table {self.config['source']['table']}")
+            self._log_to_kudu("STARTED", "Job started")
+            
+            # Step 1: Read data from AS400
+            df = self._read_as400_data()
+            record_count = df.count()
+            self.logger.info(f"Read {record_count} records from source")
+            
+            if record_count == 0:
+                self.logger.info("No new data to process")
+                self._log_to_kudu("COMPLETED", "No new data", 0)
+                return True
+            
+            # Step 2: Clean special characters if configured
+            df = self._clean_string_columns(df)
+            
+            # Step 3: Apply transformations if specified
+            if "transformations" in self.config:
+                for transform in self.config["transformations"]:
+                    if transform["type"] == "literal":
+                        df = df.withColumn(transform["column"], lit(transform["value"]))
+            
+            # Step 4: Write to targets
+            results = []
+            if "hive" in self.config["targets"]:
+                results.append(self._write_to_hive(df))
+            
+            if "teradata" in self.config["targets"]:
+                results.append(self._write_to_teradata(df))
+            
+            if "file" in self.config["targets"]:
+                results.append(self._write_to_file(df))
+            
+            # Check if all writes were successful
+            if all(results):
+                self._update_checkpoint_from_data(df)
+                self._log_to_kudu("COMPLETED", "Job completed successfully", record_count)
+                self.logger.info("Job completed successfully")
+                return True
+            else:
+                self._log_to_kudu("FAILED", "Some targets failed to write", record_count)
+                self.logger.error("Some targets failed to write")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Job failed: {str(e)}")
+            self._log_to_kudu("FAILED", f"Job failed: {str(e)}", 0)
+            return False
+
+if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="AS400 Data Importer")
+    parser.add_argument("--config", required=True, help="Path to JSON configuration file")
+    args = parser.parse_args()
+    
+    # Run the importer
+    importer = AS400DataImporter(args.config)
+    success = importer.run()
+    
+    if not success:
+        exit(1)
