@@ -1,0 +1,666 @@
+Sure! Below are several Sqoop import command examples that demonstrate how to import data from a relational database (like MySQL or PostgreSQL) into Hadoop's HDFS, Hive, or HBase. These are common use cases for a demo or learning environment.
+
+
+---
+
+🔹 Prerequisites
+
+Assume:
+
+MySQL database: demo_db
+
+Table: employees
+
+Username: root, Password: password
+
+Hadoop and Sqoop are properly installed and configured
+
+
+
+---
+
+1. ✅ Basic Sqoop Import to HDFS
+
+sqoop import \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees \
+--target-dir /user/hadoop/employees_data \
+--m 1
+
+Explanation:
+
+--connect: JDBC URL for the database
+
+--table: Source table
+
+--target-dir: HDFS directory to store data
+
+--m 1: Number of mappers (1 for simplicity)
+
+
+
+---
+
+2. ✅ Import Data with a SQL Query
+
+sqoop import \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--query "SELECT id, name, department FROM employees WHERE \$CONDITIONS" \
+--split-by id \
+--target-dir /user/hadoop/employees_filtered \
+--m 2
+
+Note:
+
+You must include \$CONDITIONS in the WHERE clause when using --query
+
+--split-by is required for parallelism with queries
+
+
+
+---
+
+3. ✅ Import Specific Columns
+
+sqoop import \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees \
+--columns "id,name,salary" \
+--target-dir /user/hadoop/employees_columns \
+--m 1
+
+
+---
+
+4. ✅ Import into Hive Table
+
+sqoop import \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees \
+--hive-import \
+--hive-table employees_hive \
+--create-hive-table \
+--m 1
+
+Tip:
+
+Hive must be configured properly with Metastore running
+
+Use --hive-overwrite to overwrite if the table exists
+
+
+
+---
+
+5. ✅ Import into HBase Table
+
+sqoop import \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees \
+--hbase-table employees_hbase \
+--column-family info \
+--hbase-row-key id \
+--m 1
+
+Requirements:
+
+HBase must be installed and running
+
+Column family (here, info) should exist or will be created
+
+
+
+---
+
+6. ✅ Import Only New Rows (Incremental Import)
+
+sqoop import \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees \
+--incremental append \
+--check-column id \
+--last-value 100 \
+--target-dir /user/hadoop/employees_incremental \
+--m 1
+
+Use Case:
+
+Pull only new records where id > 100
+
+
+
+---
+
+Let me know if you'd like to see examples using PostgreSQL, data export, or automated Sqoop jobs.
+
+Great! Here's a set of Sqoop export examples to demonstrate how to export data from HDFS (or Hive) back to a relational database, such as MySQL or PostgreSQL.
+
+
+---
+
+🔹 Prerequisites
+
+Assume:
+
+MySQL database: demo_db
+
+Target table: employees_export
+
+HDFS path with data: /user/hadoop/employees_data
+
+Data is in text format (comma-separated)
+
+Username: root, Password: password
+
+
+
+---
+
+1. ✅ Basic Sqoop Export to MySQL Table
+
+sqoop export \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees_export \
+--export-dir /user/hadoop/employees_data \
+--input-fields-terminated-by ',' \
+--m 1
+
+Explanation:
+
+--table: Destination table in MySQL (must exist)
+
+--export-dir: HDFS directory where source data is stored
+
+--input-fields-terminated-by ',': Define the delimiter used in the input data
+
+
+
+---
+
+2. ✅ Export from Hive Table (indirectly)
+
+Exporting directly from Hive isn’t supported, but you can export the underlying HDFS location used by the Hive table.
+
+sqoop export \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees_export \
+--export-dir /user/hive/warehouse/employees_hive \
+--input-fields-terminated-by '\001' \
+--m 1
+
+> \001 is Hive's default field separator.
+
+
+
+
+---
+
+3. ✅ Export with Update on Existing Rows
+
+If the target table already has some rows and you want to update matching rows instead of inserting duplicates:
+
+sqoop export \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees_export \
+--export-dir /user/hadoop/employees_data \
+--update-key id \
+--update-mode allowinsert \
+--input-fields-terminated-by ',' \
+--m 1
+
+Explanation:
+
+--update-key id: Column used to identify existing rows
+
+--update-mode allowinsert: Updates existing rows or inserts new ones
+
+
+
+---
+
+4. ✅ Export with Custom Null Handling
+
+sqoop export \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees_export \
+--export-dir /user/hadoop/employees_data \
+--input-fields-terminated-by ',' \
+--input-null-string '\\N' \
+--input-null-non-string '\\N' \
+--m 1
+
+
+---
+
+5. ✅ Export Data Using Multiple Mappers (Parallel Export)
+
+sqoop export \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees_export \
+--export-dir /user/hadoop/employees_data \
+--input-fields-terminated-by ',' \
+--m 4
+
+> Boosts performance by parallelizing data transfer.
+
+
+
+
+---
+
+6. ⚠️ Notes for Successful Export
+
+The destination table must already exist in the database.
+
+Data in HDFS must match the table schema exactly in order and type.
+
+Export works best with simple delimited text files. Avro or Parquet are not directly supported.
+
+Make sure your Hadoop user has permission to access the HDFS directory.
+
+
+
+---
+
+Let me know if you want examples for:
+
+PostgreSQL
+
+Avro/Parquet to text conversion before export
+
+Automated Sqoop jobs using saved job definitions (sqoop job)
+
+
+Certainly! Here are some practical Hive examples to help you understand how to use Hive in a demo environment. Hive is a SQL-like engine on top of Hadoop, and it’s commonly used for querying and analyzing large datasets stored in HDFS.
+
+
+---
+
+🔹 Prerequisites
+
+Assume:
+
+Hive is installed and configured (metastore running)
+
+Data file (CSV format): employees.csv
+
+HDFS location: /user/hadoop/employees.csv
+
+
+
+---
+
+1. ✅ Create a Hive Database
+
+CREATE DATABASE demo_db;
+USE demo_db;
+
+
+---
+
+2. ✅ Create a Table (External or Managed)
+
+a. External Table (data stays in HDFS location)
+
+CREATE EXTERNAL TABLE employees_ext (
+  id INT,
+  name STRING,
+  department STRING,
+  salary FLOAT
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+LOCATION '/user/hadoop/employees';
+
+b. Managed Table (Hive controls the data)
+
+CREATE TABLE employees (
+  id INT,
+  name STRING,
+  department STRING,
+  salary FLOAT
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+
+---
+
+3. ✅ Load Data into Hive Table
+
+For External Table (HDFS already has data):
+
+No need to load; just point to it in LOCATION.
+
+For Managed Table:
+
+LOAD DATA INPATH '/user/hadoop/employees.csv' INTO TABLE employees;
+
+> If you want to keep the original file, use:
+
+
+
+LOAD DATA INPATH '/user/hadoop/employees.csv' INTO TABLE employees
+OVERWRITE;
+
+
+---
+
+4. ✅ Query Data
+
+SELECT * FROM employees LIMIT 10;
+
+SELECT department, AVG(salary) AS avg_salary
+FROM employees
+GROUP BY department;
+
+
+---
+
+5. ✅ Create a Partitioned Table
+
+CREATE TABLE employees_partitioned (
+  id INT,
+  name STRING,
+  salary FLOAT
+)
+PARTITIONED BY (department STRING)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+Add a partition and load data:
+
+ALTER TABLE employees_partitioned ADD PARTITION (department='HR');
+
+LOAD DATA INPATH '/user/hadoop/hr_employees.csv'
+INTO TABLE employees_partitioned
+PARTITION (department='HR');
+
+
+---
+
+6. ✅ Create a Table from Another Table
+
+CREATE TABLE high_earners AS
+SELECT * FROM employees
+WHERE salary > 100000;
+
+
+---
+
+7. ✅ Create Table from Sqoop Import
+
+If you're importing using Sqoop with --hive-import:
+
+sqoop import \
+--connect jdbc:mysql://localhost/demo_db \
+--username root \
+--password password \
+--table employees \
+--hive-import \
+--hive-table employees_hive \
+--create-hive-table \
+--m 1
+
+
+---
+
+8. ✅ Drop Tables and Databases
+
+DROP TABLE IF EXISTS employees;
+DROP DATABASE IF EXISTS demo_db CASCADE;
+
+
+---
+
+9. ✅ View Metadata and Structure
+
+SHOW TABLES;
+DESCRIBE employees;
+DESCRIBE FORMATTED employees;
+
+
+---
+
+Let me know if you’d like:
+
+Hive to Parquet table example
+
+Hive with ORC format
+
+How to connect Hive with BI tools
+
+Integration with Spark or Presto
+
+
+Ready to dig deeper if you are.
+
+Absolutely! Here are some practical Impala examples for querying data stored in Hadoop via the Impala engine, which offers low-latency SQL queries on big data stored in HDFS or HBase.
+
+
+---
+
+🔹 Prerequisites
+
+Assume:
+
+Cloudera/Hortonworks distribution is installed
+
+Impala daemon is running
+
+Impala shell is available (you can launch it using impala-shell)
+
+Hive Metastore is shared with Impala (so Hive tables can be queried too)
+
+
+
+---
+
+✅ 1. Connect to Impala Shell
+
+impala-shell
+
+Or, to connect to a specific host:
+
+impala-shell -i impala-hostname:21000
+
+
+---
+
+✅ 2. Create Database
+
+CREATE DATABASE demo_db;
+USE demo_db;
+
+
+---
+
+✅ 3. Create Table
+
+CREATE TABLE employees (
+  id INT,
+  name STRING,
+  department STRING,
+  salary FLOAT
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE;
+
+> Impala supports several storage formats: TEXTFILE, PARQUET, ORC, AVRO
+For best performance, prefer Parquet for analytics.
+
+
+
+
+---
+
+✅ 4. Load Data into Table
+
+If file is already in HDFS:
+
+LOAD DATA INPATH '/user/hadoop/employees.csv' INTO TABLE employees;
+
+For external table:
+
+CREATE EXTERNAL TABLE employees_ext (
+  id INT,
+  name STRING,
+  department STRING,
+  salary FLOAT
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+LOCATION '/user/hadoop/employees/';
+
+
+---
+
+✅ 5. Refresh Metadata
+
+Impala doesn't automatically see new Hive/External table metadata.
+
+INVALIDATE METADATA;
+-- or
+INVALIDATE METADATA employees;
+
+If data files were updated:
+
+REFRESH employees;
+
+
+---
+
+✅ 6. Basic Queries
+
+SELECT * FROM employees LIMIT 10;
+
+SELECT department, AVG(salary)
+FROM employees
+GROUP BY department;
+
+SELECT name
+FROM employees
+WHERE salary > 100000;
+
+
+---
+
+✅ 7. Partitioned Table
+
+CREATE TABLE employees_partitioned (
+  id INT,
+  name STRING,
+  salary FLOAT
+)
+PARTITIONED BY (department STRING);
+
+Then load partitioned data:
+
+ALTER TABLE employees_partitioned ADD PARTITION (department='Sales');
+LOAD DATA INPATH '/user/hadoop/sales_employees.csv'
+INTO TABLE employees_partitioned PARTITION (department='Sales');
+
+REFRESH employees_partitioned;
+
+
+---
+
+✅ 8. Create Table as Select (CTAS)
+
+CREATE TABLE high_earners AS
+SELECT * FROM employees WHERE salary > 100000;
+
+
+---
+
+✅ 9. Create Table in Parquet Format
+
+CREATE TABLE employees_parquet (
+  id INT,
+  name STRING,
+  department STRING,
+  salary FLOAT
+)
+STORED AS PARQUET;
+
+Load data from another table:
+
+INSERT INTO employees_parquet
+SELECT * FROM employees;
+
+
+---
+
+✅ 10. Show Metadata
+
+SHOW DATABASES;
+USE demo_db;
+
+SHOW TABLES;
+DESCRIBE employees;
+DESCRIBE FORMATTED employees;
+
+
+---
+
+✅ 11. Drop Tables and Databases
+
+DROP TABLE IF EXISTS employees;
+DROP DATABASE IF EXISTS demo_db CASCADE;
+
+
+---
+
+✅ 12. Performance Tips
+
+Use Parquet + Snappy for faster query performance.
+
+Always REFRESH tables after external data changes.
+
+For best results, avoid small files; use compaction if needed.
+
+Partition by commonly filtered columns.
+
+
+
+---
+
+Let me know if you want examples for:
+
+Joining tables
+
+UDFs in Impala
+
+Working with views
+
+Impala JDBC/ODBC integration
+
+
+Happy to provide advanced use cases too.
+
