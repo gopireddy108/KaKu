@@ -1,0 +1,48 @@
+from pyspark.sql.functions import col
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+# Define expected schemas
+standard_columns = ['id', 'name', 'amount', 'date', 'status']
+
+# Mapping for format B to standard
+alt_to_standard = {
+    'user_id': 'id',
+    'full_name': 'name',
+    'total': 'amount',
+    'txn_date': 'date',
+    'txn_status': 'status'
+}
+
+# Reverse mapping to detect format B
+standard_to_alt = {v: k for k, v in alt_to_standard.items()}
+
+# Simulate dynamic input - could be file paths, table names, etc.
+table_names = spark.catalog.listTables("stage_db")  # if using Hive or Spark catalog
+# Or use glob if reading from file system: e.g., `glob("s3://bucket/stage_data/*.parquet")`
+
+dataframes = []
+
+for tbl in table_names:
+    df = spark.table(f"stage_db.{tbl.name}")
+
+    cols = df.columns
+
+    if set(standard_columns).issubset(set(cols)):
+        # Already in standard format
+        df_standard = df.select(standard_columns)
+    elif set(alt_to_standard.keys()).issubset(set(cols)):
+        # Format B — rename to standard
+        df_standard = df.select([col(old).alias(alt_to_standard[old]) for old in alt_to_standard])
+    else:
+        raise Exception(f"Unknown column format in table: {tbl.name}")
+
+    dataframes.append(df_standard)
+
+# Union all dataframes
+from functools import reduce
+final_df = reduce(lambda a, b: a.unionByName(b), dataframes)
+
+# Save or insert
+# final_df.write.saveAsTable("target_table")
