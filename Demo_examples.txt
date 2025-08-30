@@ -1,3 +1,29 @@
+Sqoop
+
+What it is: Sqoop (SQL-to-Hadoop) is a tool used to transfer data between relational databases (like MySQL, Oracle) and Hadoop.
+
+Use case: Import structured data from RDBMS into Hadoop (HDFS, Hive, HBase) and export it back.
+
+Key Feature: Helps bridge traditional databases with big data systems.
+
+2. Hive
+
+What it is: Hive is a data warehouse infrastructure built on top of Hadoop that allows querying data using a SQL-like language called HiveQL.
+
+Use case: Analyze large datasets stored in HDFS using SQL-like queries.
+
+Key Feature: Converts queries into MapReduce jobs, good for batch processing.
+
+3. Impala
+
+What it is: Impala is an open-source SQL query engine developed by Cloudera for processing data stored in HDFS and Hive tables.
+
+Use case: Real-time, low-latency querying of big data using standard SQL.
+
+Key Feature: Faster than Hive because it does not use MapReduce.
+
+
+
 Sure! Below are several Sqoop import command examples that demonstrate how to import data from a relational database (like MySQL or PostgreSQL) into Hadoop's HDFS, Hive, or HBase. These are common use cases for a demo or learning environment.
 
 
