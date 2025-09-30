@@ -1,0 +1,40 @@
+WITH cte AS (
+  SELECT
+    account_id,
+    group_concat(DISTINCT COALESCE(currency,'NULLCURR')) AS curr_list
+  FROM my_table
+  GROUP BY account_id
+),
+classified AS (
+  SELECT
+    account_id,
+    CASE
+      -- 1. Only INR
+      WHEN curr_list = 'INR' THEN 'Only INR'
+
+      -- 2. Only NULL
+      WHEN curr_list = 'NULLCURR' THEN 'Only NULL'
+
+      -- 3. Only Other (not INR, not NULL)
+      WHEN curr_list NOT LIKE '%INR%'
+           AND curr_list NOT LIKE '%NULLCURR%' THEN 'Only Other'
+
+      -- 4. INR + NULL (exactly these two)
+      WHEN curr_list IN ('INR,NULLCURR','NULLCURR,INR') THEN 'INR + NULL'
+
+      -- 5. Other + NULL (but no INR)
+      WHEN curr_list LIKE '%NULLCURR%'
+           AND curr_list NOT LIKE '%INR%' THEN 'Other + NULL'
+
+      -- 6. INR + Other + NULL
+      WHEN curr_list LIKE '%INR%'
+           AND curr_list LIKE '%NULLCURR%'
+           AND curr_list NOT IN ('INR,NULLCURR','NULLCURR,INR') THEN 'INR + Other + NULL'
+
+      ELSE 'Other Combination'
+    END AS category
+  FROM cte
+)
+SELECT category, min(account_id) AS sample_account
+FROM classified
+GROUP BY category;
