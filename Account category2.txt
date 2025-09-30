@@ -1,0 +1,30 @@
+WITH flags AS (
+  SELECT
+    account_id,
+    -- flags per account
+    MAX(CASE WHEN currency = 'INR' THEN 1 ELSE 0 END) AS has_inr,
+    MAX(CASE WHEN currency IS NULL THEN 1 ELSE 0 END) AS has_null,
+    MAX(CASE WHEN currency IS NOT NULL AND currency <> 'INR' THEN 1 ELSE 0 END) AS has_other
+  FROM my_table
+  GROUP BY account_id
+),
+classified AS (
+  SELECT
+    account_id,
+    CASE
+      WHEN has_inr = 1 AND has_null = 0 AND has_other = 0 THEN 'Only INR'
+      WHEN has_inr = 0 AND has_null = 1 AND has_other = 0 THEN 'Only NULL'
+      WHEN has_inr = 0 AND has_null = 0 AND has_other = 1 THEN 'Only Other'
+      WHEN has_inr = 1 AND has_null = 1 AND has_other = 0 THEN 'INR + NULL'
+      WHEN has_inr = 0 AND has_null = 1 AND has_other = 1 THEN 'Other + NULL'
+      WHEN has_inr = 1 AND has_null = 1 AND has_other = 1 THEN 'INR + Other + NULL'
+      ELSE 'Other Combination'
+    END AS category
+  FROM flags
+)
+SELECT 
+  category,
+  group_concat(account_id) AS accounts
+FROM classified
+GROUP BY category
+ORDER BY category;
