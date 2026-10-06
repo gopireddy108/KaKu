@@ -1,0 +1,19 @@
+1. First, we bring the data into HDFS using Sqoop and store it in a stage location as a separate file for each month. For example: "DDTNJNP202501" through "DDTNJNP202512".
+
+2. We create a stage table on top of the corresponding HDFS location. The column names are extracted from the HUB tapes, and all columns are defined with "STRING" as the data type.
+
+3. We perform validations such as record count, column validation, and checksum validation for selected columns. These validations are performed one-to-one between the HUB tape and our stage table.
+
+4. We collect the checksum values for the selected columns from the HUB tapes and store them in the Kudu metadata table provided by Ram.
+
+5. Once all the above steps are completed and the validation results match at the stage layer, we proceed with the final insertion into the golden table.
+
+6. We created the golden table structure by reviewing all available snapshots, as columns have been added and removed over time. This involves approximately 20 years × 12 months = 240 stage tables.
+
+7. Based on the golden table structure and its columns, we build the insertion statement. During the insertion, we handle operations such as trimming, type casting, NULL handling, and other transformations based on the target column data types.
+
+8. For master tables, we execute the above insertion statement to load the respective month's snapshot into the corresponding month-end date partition using an Impala command. We then validate the loaded data by comparing the previously collected checksum values with the checksum values calculated from the post-insertion data in the golden table.
+   
+   Example: The "DCACMSP202601" snapshot is loaded into the "es_hub_date='2026-01-31'" partition of the golden table.
+
+9. For transaction tables, we follow a similar insertion process. However, there are a few additional steps specific to transaction tables. No post-insertion data validation is currently performed for these tables.
