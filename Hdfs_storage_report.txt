@@ -1,0 +1,659 @@
+
+#!/usr/bin/env python3
+
+import os
+import re
+import sys
+import ssl
+import html
+import logging
+import smtplib
+import subprocess
+
+from datetime import datetime
+from email.message import EmailMessage
+from email.utils import formatdate
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+CLUSTER_NAME = os.getenv("CLUSTER_NAME", "PROD-CLUSTER")
+
+HDFS_CMD = os.getenv("HDFS_CMD", "hdfs")
+HDFS_TIMEOUT = int(os.getenv("HDFS_TIMEOUT", "120"))
+
+EDGE_SERVERS = [
+    "edge-server-01",
+    "edge-server-02"
+]
+
+SSH_USER = os.getenv("SSH_USER", "")
+SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", "30"))
+SSH_CONNECT_TIMEOUT = int(os.getenv("SSH_CONNECT_TIMEOUT", "10"))
+
+WARNING_PERCENT = float(os.getenv("WARNING_PERCENT", "80"))
+CRITICAL_PERCENT = float(os.getenv("CRITICAL_PERCENT", "90"))
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
+MAIL_TO = os.getenv("MAIL_TO", "")
+MAIL_CC = os.getenv("MAIL_CC", "")
+
+LOG_FILE = os.getenv(
+    "LOG_FILE", "hdfs_storage_email_report.log"
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# COMMON HELPERS
+# ============================================================
+
+def escape(value):
+    return html.escape(str(value))
+
+
+def parse_percent(value):
+    match = re.search(r"([\d.]+)\s*%", value or "")
+    return float(match.group(1)) if match else None
+
+
+def status_for_percent(percent):
+    if percent is None:
+        return "UNKNOWN"
+
+    if percent >= CRITICAL_PERCENT:
+        return "CRITICAL"
+
+    if percent >= WARNING_PERCENT:
+        return "WARNING"
+
+    return "HEALTHY"
+
+
+def status_color(status):
+    return {
+        "HEALTHY": "#15803d",
+        "WARNING": "#d97706",
+        "CRITICAL": "#dc2626",
+        "UNKNOWN": "#64748b",
+        "FAILED": "#dc2626"
+    }.get(status, "#64748b")
+
+
+def csv_emails(value):
+    return [
+        item.strip()
+        for item in value.split(",")
+        if item.strip()
+    ]
+
+
+# ============================================================
+# HDFS STORAGE REPORT
+# ============================================================
+
+def run_hdfs_report():
+    command = [HDFS_CMD, "dfsadmin", "-report"]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=HDFS_TIMEOUT,
+        check=False
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "HDFS command failed: "
+            + (result.stderr.strip() or "Unknown error")
+        )
+
+    if not result.stdout.strip():
+        raise RuntimeError("HDFS command returned empty output")
+
+    return result.stdout
+
+
+def extract_hdfs_value(report, label):
+    pattern = (
+        r"^\s*" + re.escape(label) +
+        r"\s*:\s*(.*?)\s*$"
+    )
+
+    match = re.search(
+        pattern,
+        report,
+        flags=re.MULTILINE | re.IGNORECASE
+    )
+
+    return match.group(1).strip() if match else "N/A"
+
+
+def parse_hdfs_report(report):
+    configured = extract_hdfs_value(
+        report, "Configured Capacity"
+    )
+    used = extract_hdfs_value(report, "DFS Used")
+    remaining = extract_hdfs_value(report, "DFS Remaining")
+    used_percent = extract_hdfs_value(report, "DFS Used%")
+
+    # Use the explicit utilization field when present.
+    # Otherwise calculate from the byte counts.
+    utilization = parse_percent(used_percent)
+
+    if utilization is None:
+        capacity_bytes = extract_hdfs_bytes(
+            report, "Configured Capacity"
+        )
+        used_bytes = extract_hdfs_bytes(report, "DFS Used")
+
+        if capacity_bytes and used_bytes is not None:
+            utilization = used_bytes * 100.0 / capacity_bytes
+
+    return {
+        "configured": configured,
+        "used": used,
+        "remaining": remaining,
+        "utilization": utilization
+    }
+
+
+def extract_hdfs_bytes(report, label):
+    value = extract_hdfs_value(report, label)
+
+    # dfsadmin -report normally includes the byte count in
+    # parentheses, e.g. "1.00 TB (1099511627776 B)".
+    match = re.search(
+        r"\(([\d,]+)\s*B\)",
+        value,
+        flags=re.IGNORECASE
+    )
+
+    if not match:
+        return None
+
+    return int(match.group(1).replace(",", ""))
+
+
+# ============================================================
+# EDGE SERVER DF -HP COLLECTION
+# ============================================================
+
+def get_edge_server_df(hostname):
+    if not SSH_USER:
+        return {
+            "hostname": hostname,
+            "status": "FAILED",
+            "error": "SSH_USER is not configured",
+            "filesystems": []
+        }
+
+    command = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+        "-o", "StrictHostKeyChecking=yes",
+        f"{SSH_USER}@{hostname}",
+        "df -hP"
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=SSH_TIMEOUT,
+            check=False
+        )
+
+        if result.returncode != 0:
+            error = result.stderr.strip() or (
+                f"SSH/df exited with code {result.returncode}"
+            )
+
+            logger.error(
+                "Filesystem collection failed on %s: %s",
+                hostname, error
+            )
+
+            return {
+                "hostname": hostname,
+                "status": "FAILED",
+                "error": error,
+                "filesystems": []
+            }
+
+        lines = result.stdout.strip().splitlines()
+
+        if not lines or not lines[0].strip().startswith("Filesystem"):
+            raise RuntimeError("Unexpected df output format")
+
+        filesystems = []
+
+        for line in lines[1:]:
+            fields = line.split(None, 5)
+
+            if len(fields) != 6:
+                logger.warning(
+                    "Skipping unrecognized df line on %s: %s",
+                    hostname, line
+                )
+                continue
+
+            filesystem, size, used, available, use_percent, mount = fields
+
+            filesystems.append({
+                "filesystem": filesystem,
+                "size": size,
+                "used": used,
+                "available": available,
+                "use_percent": use_percent,
+                "mount": mount
+            })
+
+        if not filesystems:
+            raise RuntimeError("No filesystem records found")
+
+        logger.info(
+            "Collected %d filesystem records from %s",
+            len(filesystems), hostname
+        )
+
+        return {
+            "hostname": hostname,
+            "status": "SUCCESS",
+            "error": "",
+            "filesystems": filesystems
+        }
+
+    except subprocess.TimeoutExpired:
+        logger.error("SSH/df timed out on %s", hostname)
+
+        return {
+            "hostname": hostname,
+            "status": "FAILED",
+            "error": "SSH/df command timed out",
+            "filesystems": []
+        }
+
+    except Exception as exc:
+        logger.exception(
+            "Filesystem collection failed on %s", hostname
+        )
+
+        return {
+            "hostname": hostname,
+            "status": "FAILED",
+            "error": str(exc),
+            "filesystems": []
+        }
+
+
+# ============================================================
+# HTML REPORT
+# ============================================================
+
+def build_hdfs_html(metrics):
+    utilization = metrics["utilization"]
+    status = status_for_percent(utilization)
+
+    utilization_text = (
+        f"{utilization:.2f}%"
+        if utilization is not None else "N/A"
+    )
+
+    bar_width = (
+        max(0, min(100, utilization))
+        if utilization is not None else 0
+    )
+
+    cards = [
+        ("Configured Capacity", metrics["configured"]),
+        ("DFS Used", metrics["used"]),
+        ("DFS Remaining", metrics["remaining"]),
+        ("DFS Utilization", utilization_text)
+    ]
+
+    card_html = ""
+
+    for label, value in cards:
+        card_html += f"""
+        <td style="width:25%;padding:8px;vertical-align:top">
+          <div style="background:#f1f5f9;padding:15px;
+                      border-radius:6px">
+            <div style="font-size:12px;color:#475569">
+              {escape(label)}
+            </div>
+            <div style="font-size:20px;font-weight:bold;
+                        margin-top:8px">
+              {escape(value)}
+            </div>
+          </div>
+        </td>
+        """
+
+    return f"""
+    <h2 style="font-size:18px">HDFS Storage Summary</h2>
+
+    <p>Status:
+      <strong style="color:{status_color(status)}">
+        {escape(status)}
+      </strong>
+    </p>
+
+    <table role="presentation" width="100%"
+           cellpadding="0" cellspacing="0">
+      <tr>{card_html}</tr>
+    </table>
+
+    <h3 style="font-size:15px">Storage Utilization</h3>
+
+    <div style="background:#e2e8f0;height:18px;border-radius:4px">
+      <div style="background:{status_color(status)};
+                  height:18px;width:{bar_width}%;
+                  border-radius:4px"></div>
+    </div>
+
+    <p style="font-size:12px">
+      Warning threshold: {WARNING_PERCENT}% |
+      Critical threshold: {CRITICAL_PERCENT}%
+    </p>
+    """
+
+
+def build_edge_server_html(server_results):
+    sections = []
+
+    for server in server_results:
+        hostname = escape(server["hostname"])
+
+        if server["status"] != "SUCCESS":
+            sections.append(f"""
+            <h2>Edge Server: {hostname}</h2>
+            <p style="color:#dc2626">
+              <strong>Collection FAILED:</strong>
+              {escape(server["error"])}
+            </p>
+            """)
+            continue
+
+        rows = ""
+
+        for fs in server["filesystems"]:
+            percent = parse_percent(fs["use_percent"])
+            fs_status = status_for_percent(percent)
+
+            rows += f"""
+            <tr>
+              <td>{escape(fs["filesystem"])}</td>
+              <td>{escape(fs["size"])}</td>
+              <td>{escape(fs["used"])}</td>
+              <td>{escape(fs["available"])}</td>
+              <td style="color:{status_color(fs_status)};
+                         font-weight:bold">
+                {escape(fs["use_percent"])}
+              </td>
+              <td>{escape(fs["mount"])}</td>
+            </tr>
+            """
+
+        sections.append(f"""
+        <h2 style="font-size:18px">Edge Server: {hostname}</h2>
+
+        <p style="color:#15803d">
+          <strong>Collection successful</strong>
+        </p>
+
+        <table style="width:100%;border-collapse:collapse;
+                      font-size:12px">
+          <thead>
+            <tr style="background:#e2e8f0">
+              <th>Filesystem</th>
+              <th>Size</th>
+              <th>Used</th>
+              <th>Available</th>
+              <th>Use %</th>
+              <th>Mount Point</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+        """)
+
+    return (
+        "<h2 style='font-size:20px'>"
+        "Edge Server Filesystem Utilization</h2>"
+        + "".join(sections)
+    )
+
+
+def build_html(metrics, server_results):
+    timestamp = datetime.now().astimezone().strftime(
+        "%Y-%m-%d %H:%M:%S %Z"
+    )
+
+    hdfs_status = status_for_percent(metrics["utilization"])
+
+    # Overall status includes collection failures and high usage
+    overall_status = hdfs_status
+
+    if any(s["status"] != "SUCCESS" for s in server_results):
+        overall_status = "WARNING"
+
+    for server in server_results:
+        for fs in server["filesystems"]:
+            percent = parse_percent(fs["use_percent"])
+
+            if percent is not None and percent >= CRITICAL_PERCENT:
+                overall_status = "CRITICAL"
+            elif (
+                percent is not None
+                and percent >= WARNING_PERCENT
+                and overall_status not in ("CRITICAL",)
+            ):
+                overall_status = "WARNING"
+
+    if hdfs_status == "CRITICAL":
+        overall_status = "CRITICAL"
+    elif hdfs_status == "WARNING" and overall_status == "HEALTHY":
+        overall_status = "WARNING"
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+</head>
+
+<body style="margin:0;background:#f8fafc;
+             font-family:Arial,sans-serif;color:#0f172a">
+
+<table role="presentation" width="100%" cellpadding="0"
+       cellspacing="0">
+<tr>
+<td align="center" style="padding:20px">
+
+<table role="presentation" width="100%" cellpadding="0"
+       cellspacing="0"
+       style="max-width:1100px;background:#ffffff;
+              border:1px solid #e2e8f0">
+
+<tr>
+<td style="background:#172554;color:#ffffff;padding:24px">
+  <h1 style="margin:0;font-size:24px">
+    HDFS Storage & Edge Server Report
+  </h1>
+  <p>{escape(CLUSTER_NAME)}</p>
+  <p style="font-size:12px">
+    Generated: {escape(timestamp)}
+  </p>
+  <p>
+    Overall Status:
+    <strong style="color:#ffffff">
+      {escape(overall_status)}
+    </strong>
+  </p>
+</td>
+</tr>
+
+<tr>
+<td style="padding:20px">
+
+{build_hdfs_html(metrics)}
+
+<hr style="border:0;border-top:1px solid #e2e8f0;
+           margin:24px 0">
+
+{build_edge_server_html(server_results)}
+
+<hr style="border:0;border-top:1px solid #e2e8f0;
+           margin-top:24px">
+
+<p style="font-size:11px;color:#64748b">
+  HDFS source: hdfs dfsadmin -report<br>
+  Edge filesystem source: df -hP over SSH<br>
+  Automatically generated report.
+</p>
+
+</td>
+</tr>
+</table>
+
+</td>
+</tr>
+</table>
+</body>
+</html>"""
+
+
+# ============================================================
+# EMAIL
+# ============================================================
+
+def send_email(subject, html_body):
+    if not SMTP_HOST or not MAIL_FROM or not MAIL_TO:
+        raise ValueError(
+            "SMTP_HOST, MAIL_FROM and MAIL_TO must be configured"
+        )
+
+    recipients = csv_emails(MAIL_TO) + csv_emails(MAIL_CC)
+
+    if not recipients:
+        raise ValueError("At least one email recipient is required")
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = MAIL_FROM
+    message["To"] = MAIL_TO
+
+    if MAIL_CC:
+        message["Cc"] = MAIL_CC
+
+    message["Date"] = formatdate(localtime=True)
+
+    message.set_content(
+        "Please use an HTML-capable email client to view "
+        "the HDFS storage and edge server report."
+    )
+    message.add_alternative(html_body, subtype="html")
+
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP(
+        SMTP_HOST, SMTP_PORT, timeout=30
+    ) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
+
+        if SMTP_USER:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+
+        server.send_message(
+            message,
+            to_addrs=recipients
+        )
+
+    logger.info("Email sent successfully")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    try:
+        logger.info("Starting HDFS storage email report")
+
+        report = run_hdfs_report()
+        metrics = parse_hdfs_report(report)
+
+        server_results = [
+            get_edge_server_df(host)
+            for host in EDGE_SERVERS
+        ]
+
+        html_body = build_html(metrics, server_results)
+
+        # Determine the subject status.
+        status = status_for_percent(metrics["utilization"])
+
+        if any(s["status"] != "SUCCESS" for s in server_results):
+            if status != "CRITICAL":
+                status = "WARNING"
+
+        for server in server_results:
+            for fs in server["filesystems"]:
+                percent = parse_percent(fs["use_percent"])
+
+                if percent is not None and percent >= CRITICAL_PERCENT:
+                    status = "CRITICAL"
+                elif (
+                    percent is not None
+                    and percent >= WARNING_PERCENT
+                    and status == "HEALTHY"
+                ):
+                    status = "WARNING"
+
+        subject = (
+            f"[{status}] {CLUSTER_NAME} - "
+            f"HDFS Storage and Edge Server Report"
+        )
+
+        send_email(subject, html_body)
+
+        logger.info("Report completed successfully")
+
+        # Nonzero exit if either edge server failed.
+        if any(s["status"] != "SUCCESS" for s in server_results):
+            return 1
+
+        return 0
+
+    except subprocess.TimeoutExpired:
+        logger.exception("HDFS report command timed out")
+    except Exception:
+        logger.exception("HDFS storage report failed")
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
