@@ -1,0 +1,17 @@
+export CLUSTER_NAME="PROD-CLUSTER"
+
+export SSH_USER="your_linux_user"
+
+export SMTP_HOST="smtp.yourcompany.com"
+export SMTP_PORT="587"
+export SMTP_USER="hdfs-monitor@yourcompany.com"
+export SMTP_PASSWORD="your-secret-from-approved-secret-store"
+
+export MAIL_FROM="hdfs-monitor@yourcompany.com"
+export MAIL_TO="data-team@yourcompany.com,admin@yourcompany.com"
+export MAIL_CC=""
+
+export WARNING_PERCENT="80"
+export CRITICAL_PERCENT="90"
+
+export LOG_FILE="/var/log/hdfs_storage_email_report.log"
