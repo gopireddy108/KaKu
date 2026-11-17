@@ -1,0 +1,369 @@
+
+#!/bin/bash
+
+###############################################################################
+# Script Name : hive_impala_runner.sh
+# Purpose     : Execute Hive/Impala SQL scripts sequentially,
+#               consolidate logs, backup source files and create ZIP archive.
+#
+# Usage       : ./hive_impala_runner.sh hive
+#               ./hive_impala_runner.sh impala
+#
+# Exit Codes  : 0 = Success
+#               1 = Failure
+###############################################################################
+
+set -Eeuo pipefail
+
+#==============================================================================
+# CONFIGURATION
+#==============================================================================
+
+BASE_DIR="/opt/hive_impala_runner"
+
+SOURCE_DIR="${BASE_DIR}/source"
+BACKUP_DIR="${BASE_DIR}/backup"
+LOG_DIR="${BASE_DIR}/logs"
+
+SCRIPT_LIST="${SOURCE_DIR}/script_list.txt"
+
+TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+
+LOG_FILE="${LOG_DIR}/execution_${TIMESTAMP}.log"
+ARCHIVE_DIR="${BACKUP_DIR}/execution_${TIMESTAMP}"
+ZIP_FILE="${BACKUP_DIR}/execution_${TIMESTAMP}.zip"
+
+#==============================================================================
+# LOGGING FUNCTION
+#==============================================================================
+
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+#==============================================================================
+# INITIALIZATION
+#==============================================================================
+
+mkdir -p "$LOG_DIR" "$BACKUP_DIR"
+
+# Redirect complete stdout and stderr to one log file.
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+#==============================================================================
+# VALIDATE INPUT ARGUMENT
+#==============================================================================
+
+if [[ $# -ne 1 ]]; then
+    log_message "ERROR: Exactly one argument is required."
+    log_message "Usage: $0 <hive|impala>"
+    exit 1
+fi
+
+ENGINE=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+
+case "$ENGINE" in
+    hive)
+        EXEC_COMMAND="hive"
+        ;;
+    impala)
+        EXEC_COMMAND="impala-shell"
+        ;;
+    *)
+        log_message "ERROR: Invalid argument: $1"
+        log_message "Allowed values: hive or impala"
+        exit 1
+        ;;
+esac
+
+#==============================================================================
+# FUNCTION 1: VALIDATE AND EXECUTE SCRIPTS
+#==============================================================================
+
+execute_scripts() {
+
+    log_message "Starting ${ENGINE} execution."
+
+    # Validate source directory.
+    if [[ ! -d "$SOURCE_DIR" ]]; then
+        log_message "ERROR: Source directory not found."
+        return 1
+    fi
+
+    # Validate script list.
+    if [[ ! -f "$SCRIPT_LIST" || ! -r "$SCRIPT_LIST" ]]; then
+        log_message "ERROR: Script list missing or unreadable."
+        return 1
+    fi
+
+    # Validate Hive/Impala command.
+    if ! command -v "$EXEC_COMMAND" >/dev/null 2>&1; then
+        log_message "ERROR: Command not available: $EXEC_COMMAND"
+        return 1
+    fi
+
+    local source_real
+    local script_path
+    local resolved_path
+    local count=0
+    local status=0
+    local -a scripts=()
+
+    source_real=$(realpath -e "$SOURCE_DIR") || return 1
+
+    #--------------------------------------------------------------------------
+    # First pass: Validate ALL script paths before executing anything.
+    #--------------------------------------------------------------------------
+
+    while IFS= read -r script_path || [[ -n "$script_path" ]]; do
+
+        # Remove leading and trailing whitespace.
+        script_path="${script_path#"${script_path%%[![:space:]]*}"}"
+        script_path="${script_path%"${script_path##*[![:space:]]}"}"
+
+        # Skip empty lines and comments.
+        [[ -z "$script_path" ]] && continue
+        [[ "$script_path" == \#* ]] && continue
+
+        # Resolve relative paths against source directory.
+        if [[ "$script_path" = /* ]]; then
+            resolved_path="$script_path"
+        else
+            resolved_path="${SOURCE_DIR}/${script_path}"
+        fi
+
+        # Check file existence and readability.
+        if [[ ! -f "$resolved_path" || ! -r "$resolved_path" ]]; then
+            log_message "ERROR: Invalid script: $script_path"
+            return 1
+        fi
+
+        # Resolve absolute path.
+        resolved_path=$(realpath -e "$resolved_path") || return 1
+
+        # Prevent scripts outside source directory.
+        if [[ "$resolved_path" != "$source_real/"* ]]; then
+            log_message "ERROR: Script outside source directory: $script_path"
+            return 1
+        fi
+
+        scripts+=("$resolved_path")
+        count=$((count + 1))
+
+    done < "$SCRIPT_LIST"
+
+    if [[ $count -eq 0 ]]; then
+        log_message "ERROR: No valid scripts found."
+        return 1
+    fi
+
+    log_message "Total scripts validated: $count"
+
+    #--------------------------------------------------------------------------
+    # Second pass: Execute scripts sequentially.
+    #--------------------------------------------------------------------------
+
+    count=0
+
+    for resolved_path in "${scripts[@]}"; do
+
+        count=$((count + 1))
+
+        log_message "--------------------------------------------------"
+        log_message "Executing script ${count}: ${resolved_path}"
+        log_message "Execution engine: ${ENGINE}"
+        log_message "--------------------------------------------------"
+
+        # Execute Hive or Impala.
+        if [[ "$ENGINE" == "hive" ]]; then
+
+            if hive -f "$resolved_path"; then
+                status=0
+            else
+                status=$?
+            fi
+
+        else
+
+            if impala-shell -f "$resolved_path"; then
+                status=0
+            else
+                status=$?
+            fi
+
+        fi
+
+        # Check execution status.
+        if [[ $status -ne 0 ]]; then
+            log_message "ERROR: Script execution failed."
+            log_message "Script: $resolved_path"
+            log_message "Exit code: $status"
+            return 1
+        fi
+
+        log_message "SUCCESS: Script executed successfully."
+
+    done
+
+    log_message "All ${count} scripts executed successfully."
+
+    return 0
+}
+
+#==============================================================================
+# FUNCTION 2: BACKUP SOURCE FILES
+#==============================================================================
+
+backup_source_files() {
+
+    log_message "Starting source backup."
+
+    local source_real
+    local script_path
+    local resolved_path
+    local relative_path
+
+    source_real=$(realpath -e "$SOURCE_DIR") || return 1
+
+    # Create timestamped backup directory.
+    if [[ -e "$ARCHIVE_DIR" || -e "$ZIP_FILE" ]]; then
+        log_message "ERROR: Backup destination already exists."
+        return 1
+    fi
+
+    mkdir -p "$ARCHIVE_DIR" || return 1
+
+    # Move executed SQL files while preserving directory structure.
+    while IFS= read -r script_path || [[ -n "$script_path" ]]; do
+
+        script_path="${script_path#"${script_path%%[![:space:]]*}"}"
+        script_path="${script_path%"${script_path##*[![:space:]]}"}"
+
+        [[ -z "$script_path" ]] && continue
+        [[ "$script_path" == \#* ]] && continue
+
+        if [[ "$script_path" = /* ]]; then
+            resolved_path="$script_path"
+        else
+            resolved_path="${SOURCE_DIR}/${script_path}"
+        fi
+
+        resolved_path=$(realpath -e "$resolved_path") || {
+            log_message "ERROR: Cannot resolve backup file: $script_path"
+            return 1
+        }
+
+        if [[ "$resolved_path" != "$source_real/"* ]]; then
+            log_message "ERROR: Invalid backup path: $script_path"
+            return 1
+        fi
+
+        relative_path="${resolved_path#"$source_real/"}"
+
+        mkdir -p "${ARCHIVE_DIR}/$(dirname "$relative_path")" || return 1
+
+        if ! mv -- "$resolved_path" "${ARCHIVE_DIR}/${relative_path}"; then
+            log_message "ERROR: Failed to move $relative_path"
+            return 1
+        fi
+
+        log_message "Backed up: $relative_path"
+
+    done < "$SCRIPT_LIST"
+
+    # Move script list file into backup.
+    if ! mv -- "$SCRIPT_LIST" "${ARCHIVE_DIR}/script_list.txt"; then
+        log_message "ERROR: Failed to move script_list.txt"
+        return 1
+    fi
+
+    log_message "Source backup completed successfully."
+
+    return 0
+}
+
+#==============================================================================
+# FUNCTION 3: ZIP BACKUP DIRECTORY
+#==============================================================================
+
+compress_backup() {
+
+    log_message "Starting backup compression."
+
+    if ! command -v zip >/dev/null 2>&1; then
+        log_message "ERROR: zip utility is not installed."
+        return 1
+    fi
+
+    if ! (
+        cd "$BACKUP_DIR" &&
+        zip -r "$(basename "$ZIP_FILE")" "$(basename "$ARCHIVE_DIR")"
+    ); then
+
+        log_message "ERROR: ZIP compression failed."
+        return 1
+    fi
+
+    # Validate ZIP archive.
+    if ! unzip -t "$ZIP_FILE"; then
+        log_message "ERROR: ZIP validation failed."
+        return 1
+    fi
+
+    log_message "ZIP archive created and validated successfully."
+    log_message "Archive: $ZIP_FILE"
+
+    return 0
+}
+
+#==============================================================================
+# MAIN PROCESS
+#==============================================================================
+
+log_message "======================================================"
+log_message "HIVE / IMPALA EXECUTION STARTED"
+log_message "Engine         : $ENGINE"
+log_message "Source         : $SOURCE_DIR"
+log_message "Script List    : $SCRIPT_LIST"
+log_message "Log File       : $LOG_FILE"
+log_message "======================================================"
+
+# STEP 1: Execute scripts.
+if ! execute_scripts; then
+
+    log_message "PROCESS FAILED: SQL execution or validation failure."
+    log_message "Source files retained."
+    exit 1
+
+fi
+
+# STEP 2: Backup source files.
+if ! backup_source_files; then
+
+    log_message "PROCESS FAILED: Backup operation failed."
+    exit 1
+
+fi
+
+# STEP 3: Compress backup.
+if ! compress_backup; then
+
+    log_message "PROCESS FAILED: Compression operation failed."
+    log_message "Backup directory retained: $ARCHIVE_DIR"
+    exit 1
+
+fi
+
+#==============================================================================
+# SUCCESS
+#==============================================================================
+
+log_message "======================================================"
+log_message "PROCESS COMPLETED SUCCESSFULLY"
+log_message "Engine         : $ENGINE"
+log_message "Backup Folder  : $ARCHIVE_DIR"
+log_message "ZIP Archive    : $ZIP_FILE"
+log_message "Execution Log  : $LOG_FILE"
+log_message "======================================================"
+
+exit 0
